@@ -145,6 +145,65 @@ class MossAudioTokenizerQuantizer:
             return {"allocated_mb": allocated, "reserved_mb": reserved}
         return {"allocated_mb": 0, "reserved_mb": 0}
 
+    def save_quantized_model(self, suffix: str = "-FP16"):
+        """Save model in two safetensors shards: encoder/decoder in fp16, quantizer in fp32."""
+        if self.model is None:
+            raise ValueError("Model not loaded")
+
+        import os, shutil, json
+        from pathlib import Path
+        from safetensors.torch import save_file
+
+        save_path = Path(self.model_path).parent / (Path(self.model_path).name + suffix)
+        save_path.mkdir(parents=True, exist_ok=True)
+        print(f"Saving to {save_path}...")
+
+        shard1_name = "model-00001-of-00002.safetensors"  # encoder/decoder fp16
+        shard2_name = "model-00002-of-00002.safetensors"  # quantizer fp32
+
+        shard1, shard2 = {}, {}
+        weight_map = {}
+
+        for key, tensor in self.model.state_dict().items():
+            if key.startswith("quantizer"):
+                shard2[key] = tensor.to(torch.float32)
+                weight_map[key] = shard2_name
+            else:
+                shard1[key] = tensor.to(torch.float16)
+                weight_map[key] = shard1_name
+
+        save_file(shard1, str(save_path / shard1_name),
+                metadata={"dtype": "float16", "contents": "encoder_decoder"})
+        save_file(shard2, str(save_path / shard2_name),
+                metadata={"dtype": "float32", "contents": "quantizer"})
+
+        print(f"  ✓ Shard 1 (fp16 encoder/decoder): {(save_path / shard1_name).stat().st_size / 1024**3:.2f} GB")
+        print(f"  ✓ Shard 2 (fp32 quantizer):        {(save_path / shard2_name).stat().st_size / 1024**3:.2f} GB")
+
+        # Write index JSON
+        index = {
+            "metadata": {
+                "total_size": sum(t.nbytes for t in {**shard1, **shard2}.values()),
+                "shard_dtype_map": {
+                    shard1_name: "float16",
+                    shard2_name: "float32",
+                }
+            },
+            "weight_map": weight_map,
+        }
+        with open(save_path / "model.safetensors.index.json", "w") as f:
+            json.dump(index, f, indent=2)
+        print("  ✓ Index written with dtype metadata")
+
+        # Copy config/tokenizer files
+        for fname in os.listdir(self.model_path):
+            if fname.endswith(('.json', '.txt', '.py', '.model', '.tiktoken')):
+                src, dst = Path(self.model_path) / fname, save_path / fname
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+
+        print(f"✓ Done. Saved to {save_path}")
+        return str(save_path)
 
 def create_test_audio(duration: float = 1.0, sample_rate: int = 24000):
     """Create test audio."""
@@ -235,6 +294,12 @@ def main():
                 "mse": metrics['mse'],
                 "status": "✓ OK" if metrics['snr_db'] > 10 else "✗ BAD"
             })
+
+            # Save the quantized model (only for float16 config)
+            if config["name"] == "float16":
+                save_path = quantizer.save_quantized_model(suffix="-FP16")
+                print(f"✓ Saved to: {save_path}")
+
         except Exception as e:
             print(f"✗ FAILED: {e}")
             results.append({
