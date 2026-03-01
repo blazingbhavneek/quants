@@ -16,3 +16,5 @@ gptqmodel_offload/
 llm-compressor/
 inference_root/
 moss_qwen3_staging/
+merge_staging/
+seed-tts-eval/
